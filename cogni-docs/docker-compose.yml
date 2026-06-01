@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: cognidocs-postgres
+    environment:
+      POSTGRES_USER: cogni
+      POSTGRES_PASSWORD: cogni_local
+      POSTGRES_DB: cognidocs
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    container_name: cognidocs-redis
+    ports:
+      - "6379:6379"
+
+volumes:
+  postgres_data:

@@ -1,0 +1,4 @@
+# Phase 1: Azure Functions worker dependencies will go here
+# azure-servicebus
+# azure-storage-blob
+# python-dotenv
