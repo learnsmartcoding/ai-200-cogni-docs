@@ -2,186 +2,194 @@
 # documents.py — Document Upload and List Endpoints
 # =============================================================================
 #
-# Defines the REST endpoints under /documents using FastAPI's APIRouter.
-# APIRouter groups related endpoints — like a .NET Controller class.
+# PHASE HISTORY:
+#   Phase 0: saved uploaded files to local disk (uploads/ folder)
+#   Phase 1a (NOW): saves files to Azure Blob Storage instead
 #
-# PHASE ROADMAP for this file:
-#   Phase 0 (now):  save file to local disk, record in PostgreSQL
-#   Phase 1:        save file to Azure Blob Storage instead of local disk
-#   Phase 2:        after saving, trigger embedding generation via the worker
+# WHY BLOB STORAGE?
+#   Local disk doesn't work in the cloud — containers are stateless and
+#   restart frequently, wiping any saved files. Azure Blob Storage is the
+#   cloud-native solution: durable, scalable, and accessible from anywhere.
+#   It's the equivalent of AWS S3 or a shared network drive, but for Azure.
 #
-# KEY PYTHON CONCEPT — "from x import y":
-#   Imports only specific symbols from a module, not everything.
-#   Equivalent to C# "using" — but in Python you can be selective per import.
+# AI-200 OBJECTIVE COVERED (Phase 1a):
+#   This sets up the foundation for Event Grid in Phase 1b.
+#   When a file lands in Blob Storage, Azure fires a BlobCreated event
+#   automatically — our Function App will react to that event.
 # =============================================================================
 
 from fastapi import APIRouter, UploadFile, File, HTTPException
-# APIRouter   — groups related routes, like a .NET Controller
-# UploadFile  — represents a file sent via multipart/form-data
-# File        — parameter marker that tells FastAPI to expect a file input
-# HTTPException — returns HTTP error responses (like BadRequest() in .NET)
+from database import get_connection
+import os, uuid
+from dotenv import load_dotenv
 
-from database import get_connection   # Our PostgreSQL helper defined in database.py
+# azure-storage-blob is the official Azure SDK package for Blob Storage.
+# BlobServiceClient is the top-level client — it connects to a Storage Account.
+from azure.storage.blob import BlobServiceClient
 
-# KEY PYTHON CONCEPT — importing multiple modules on one line:
-# "import os, shutil, uuid" is shorthand for three separate import statements.
-# Commonly used for small standard-library modules.
-import os       # File path utilities: os.path.join, os.makedirs, os.path.splitext
-import shutil   # File stream copy utility: shutil.copyfileobj
-import uuid     # Generates random unique IDs — like Guid.NewGuid() in C#
+# Load .env values (AZURE_STORAGE_CONNECTION_STRING, etc.) into environment
+load_dotenv()
 
-
-# -----------------------------------------------------------------------------
-# Create the router.
-# prefix="/documents" means every route in this file starts with /documents.
-# tags=["documents"] groups all these routes under one section in Swagger UI.
-# -----------------------------------------------------------------------------
 router = APIRouter(prefix="/documents", tags=["documents"])
 
-# Local folder where uploaded files are saved (Phase 0 only).
-# Phase 1 will replace this with Azure Blob Storage.
-UPLOAD_DIR = "uploads"
 
-# os.makedirs creates the folder if it doesn't exist yet.
-# exist_ok=True means: don't raise an error if it already exists.
-# Equivalent to Directory.CreateDirectory() in .NET — safe to call repeatedly.
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+# =============================================================================
+# BLOB STORAGE CLIENT SETUP
+# =============================================================================
+# Read config from environment variables (set in .env file).
+# Never hardcode connection strings — they contain credentials.
+
+AZURE_STORAGE_CONNECTION_STRING = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+AZURE_STORAGE_CONTAINER = os.getenv("AZURE_STORAGE_CONTAINER", "documents")
+# os.getenv("KEY", "default") returns "default" if KEY is not set.
+# Here we default the container name to "documents" if not specified in .env.
 
 
-# -----------------------------------------------------------------------------
-# @router.post("/upload") registers an HTTP POST endpoint at /documents/upload
-#
-# KEY PYTHON CONCEPT — Decorators:
-# The @ symbol marks a decorator. It wraps the function below it with extra
-# behaviour — in this case, registering it as a POST route in FastAPI.
-# In .NET: [HttpPost("upload")] on a controller method does the same thing.
-# -----------------------------------------------------------------------------
+def get_blob_service_client() -> BlobServiceClient:
+    """
+    Creates and returns an Azure Blob Storage client.
+
+    BlobServiceClient is the entry point for all Blob Storage operations.
+    It connects to a Storage Account using a connection string.
+
+    The connection string contains the account name, account key, and endpoint.
+    Format: DefaultEndpointsProtocol=https;AccountName=...;AccountKey=...;
+
+    In .NET this would be:
+        new BlobServiceClient(connectionString)
+    """
+    if not AZURE_STORAGE_CONNECTION_STRING:
+        # Raise a clear error if the .env value is missing —
+        # better than a cryptic Azure SDK error later.
+        raise ValueError(
+            "AZURE_STORAGE_CONNECTION_STRING is not set in your .env file. "
+            "Run the Azure CLI command to get it and add it to .env."
+        )
+
+    # from_connection_string() is a class method (like a static factory in C#).
+    # It parses the connection string and configures the client automatically.
+    return BlobServiceClient.from_connection_string(AZURE_STORAGE_CONNECTION_STRING)
+
+
+# =============================================================================
+# UPLOAD ENDPOINT — POST /documents/upload
+# =============================================================================
 @router.post("/upload")
 async def upload_document(file: UploadFile = File(...)):
     """
-    Accepts a PDF or TXT file upload, saves it to disk, and records
-    its metadata in PostgreSQL.
+    Accepts a PDF or TXT file, uploads it to Azure Blob Storage,
+    and records its metadata + Blob URL in PostgreSQL.
 
-    Args:
-        file (UploadFile): The uploaded file from the HTTP request.
-                           FastAPI automatically parses the multipart/form-data body.
-                           File(...) means this parameter is REQUIRED.
-                           The '...' (Ellipsis) is Python's built-in way to mark
-                           something as mandatory — similar to [Required] in .NET.
+    CHANGE FROM PHASE 0:
+      Before: saved to local 'uploads/' folder, stored local file path in DB
+      Now:    uploads to Azure Blob Storage, stores the public Blob URL in DB
+
+    After this endpoint returns, Azure will automatically fire a BlobCreated
+    event — which we'll connect to an Azure Function in Phase 1b.
     """
     # ── Step 1: Validate file type ─────────────────────────────────────────
-    # file.content_type is the MIME type sent by the browser, e.g. "application/pdf"
     allowed_types = ["application/pdf", "text/plain"]
-
-    # KEY PYTHON CONCEPT — "in" operator:
-    # "x not in list" checks whether x is absent from the list.
-    # Equivalent to: !allowedTypes.Contains(file.ContentType) in C#
     if file.content_type not in allowed_types:
-        # HTTPException raises an HTTP error response and stops execution.
-        # status_code=400 is "Bad Request" — same as return BadRequest(...) in .NET.
         raise HTTPException(status_code=400, detail="Only PDF and .txt files are supported")
 
-    # ── Step 2: Build a unique file path ───────────────────────────────────
-    # Generate a random ID so two files named "report.pdf" don't overwrite each other.
-    # str(uuid.uuid4()) produces something like: "3f2a1b9c-4e7d-4a8f-b6c5-d2e1f0a9b8c7"
+    # ── Step 2: Build a unique blob name ───────────────────────────────────
+    # Blob Storage is a flat key-value store — there are no real folders,
+    # just names. We prefix with "raw/" to logically organise files.
+    # e.g. "raw/3f2a1b9c-4e7d.pdf"
     file_id = str(uuid.uuid4())
-
-    # os.path.splitext("report.pdf") returns the tuple ("report", ".pdf")
-    # [1] takes the second element — the extension including the dot.
     extension = os.path.splitext(file.filename)[1]
+    blob_name = f"raw/{file_id}{extension}"
+    # "raw/" prefix means: this is the original uploaded file, not yet processed.
+    # Phase 2 workers will produce "chunks/" blobs alongside these.
 
-    # KEY PYTHON CONCEPT — f-strings:
-    # f"..." is Python's string interpolation (like $"..." in C#).
-    # {file_id} and {extension} are replaced with their values at runtime.
-    file_path = os.path.join(UPLOAD_DIR, f"{file_id}{extension}")
-    # Result example: "uploads/3f2a1b9c-4e7d-4a8f-b6c5-d2e1f0a9b8c7.pdf"
+    # ── Step 3: Upload to Azure Blob Storage ───────────────────────────────
+    try:
+        # Get a client for the whole Storage Account
+        blob_service = get_blob_service_client()
 
-    # ── Step 3: Save the file to disk ──────────────────────────────────────
-    # KEY PYTHON CONCEPT — "with" statement:
-    # 'with open(...) as buffer' opens a file and automatically closes it when
-    # the indented block finishes — even if an error occurs.
-    # This is Python's equivalent of C#'s 'using (var stream = File.OpenWrite(...))'.
-    #
-    # "wb" means: open for Writing in Binary mode (needed for PDFs and any non-text file).
-    with open(file_path, "wb") as buffer:
-        # shutil.copyfileobj reads from the upload stream (file.file) and writes
-        # it to our local file (buffer) in chunks — memory-efficient for large files.
-        shutil.copyfileobj(file.file, buffer)
+        # Get a client scoped to our specific container ("documents")
+        # A container is like a bucket — it holds a collection of blobs.
+        container_client = blob_service.get_container_client(AZURE_STORAGE_CONTAINER)
+
+        # Get a client for this specific blob (the file we're uploading)
+        blob_client = container_client.get_blob_client(blob_name)
+
+        # upload_blob() streams the file to Azure.
+        # file.file is a file-like stream object (similar to Stream in .NET).
+        # overwrite=True means: replace if a blob with this name already exists.
+        blob_client.upload_blob(file.file, overwrite=True)
+
+        # After upload, blob_client.url gives us the full HTTPS URL to the blob.
+        # Example: https://stcognidocs.blob.core.windows.net/documents/raw/3f2a...pdf
+        blob_url = blob_client.url
+
+    # KEY PYTHON CONCEPT — "except ExceptionType as e":
+    # Catches a specific type of exception (not all exceptions).
+    # This is like "catch (Azure.RequestFailedException ex)" in C#.
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to upload to Azure Blob Storage: {str(e)}"
+        )
 
     # ── Step 4: Record metadata in PostgreSQL ──────────────────────────────
-    conn = get_connection()    # Open a database connection
-    cursor = conn.cursor()     # Create a cursor to run SQL
-
-    # Execute a parameterised INSERT statement.
-    # %s are placeholders — psycopg2 safely substitutes the tuple values in order.
-    # This prevents SQL injection, the same as using SqlParameter in .NET.
-    # RETURNING id, created_at tells PostgreSQL to give back the auto-generated values.
+    # We now store the Blob URL in file_path instead of a local disk path.
+    conn = get_connection()
+    cursor = conn.cursor()
     cursor.execute(
         """
         INSERT INTO documents (filename, content_type, file_path, status)
         VALUES (%s, %s, %s, %s)
         RETURNING id, created_at
         """,
-        (file.filename, file.content_type, file_path, "uploaded")
-        # This tuple maps to the four %s placeholders in the SQL above, in order.
+        (file.filename, file.content_type, blob_url, "uploaded")
+        #                                  ^^^^^^^^
+        #                                  blob_url instead of local file_path
     )
-
-    # KEY PYTHON CONCEPT — tuple unpacking:
-    # cursor.fetchone() returns one row as a tuple, e.g. (42, datetime(2025, 5, 26, ...))
-    # "doc_id, created_at = ..." unpacks the tuple into two separate variables.
-    # In C# this is: var (docId, createdAt) = (row[0], row[1]);
     doc_id, created_at = cursor.fetchone()
+    conn.commit()
+    cursor.close()
+    conn.close()
 
-    conn.commit()     # Save the INSERT permanently
-    cursor.close()    # Release the cursor
-    conn.close()      # Release the connection
-
-    # ── Step 5: Return the result as JSON ──────────────────────────────────
-    # Returning a Python dict from FastAPI automatically serialises it to JSON.
+    # ── Step 5: Return the result ──────────────────────────────────────────
     return {
         "id": doc_id,
         "filename": file.filename,
+        "blob_name": blob_name,
+        "blob_url": blob_url,
         "status": "uploaded",
-        "created_at": str(created_at),   # str() converts the datetime object to a readable string
-        "message": "Stored locally. In Phase 1 this will go to Azure Blob Storage."
+        "created_at": str(created_at),
+        "next": "Azure Event Grid will detect this blob and trigger the Function App (Phase 1b)"
     }
 
 
-# -----------------------------------------------------------------------------
-# @router.get("/") registers a GET endpoint at /documents/
-# -----------------------------------------------------------------------------
+# =============================================================================
+# LIST ENDPOINT — GET /documents/
+# =============================================================================
 @router.get("/")
 async def list_documents():
     """
     Returns all uploaded documents from PostgreSQL, newest first.
-    Equivalent to a GetAll() repository method in .NET.
+    The file_path column now contains Azure Blob URLs instead of local paths.
     """
     conn = get_connection()
     cursor = conn.cursor()
-
-    # SELECT all rows, ordered newest-first (DESC = descending order)
     cursor.execute(
-        "SELECT id, filename, content_type, status, created_at FROM documents ORDER BY created_at DESC"
+        "SELECT id, filename, content_type, file_path, status, created_at "
+        "FROM documents ORDER BY created_at DESC"
     )
-
-    # fetchall() returns every matching row as a list of tuples.
-    # Example: [(1, "report.pdf", "application/pdf", "uploaded", datetime(...)), ...]
     rows = cursor.fetchall()
     cursor.close()
     conn.close()
 
-    # KEY PYTHON CONCEPT — List comprehension:
-    # [ expression  for item in iterable ]
-    # Builds a new list by running 'expression' for every 'item' in 'iterable'.
-    # This is equivalent to LINQ's .Select() in C#:
-    #   rows.Select(row => new { id = row[0], filename = row[1], ... }).ToList()
     return [
         {
             "id":           row[0],
             "filename":     row[1],
             "content_type": row[2],
-            "status":       row[3],
-            "created_at":   str(row[4])
+            "blob_url":     row[3],   # Was file_path in Phase 0, now a Blob URL
+            "status":       row[4],
+            "created_at":   str(row[5])
         }
-        for row in rows   # Iterates over every tuple in the rows list
+        for row in rows
     ]

@@ -44,32 +44,55 @@ def get_connection():
     psycopg2.connect() takes a connection URL in this format:
         postgresql://username:password@host:port/database_name
 
+    Phase 0: POSTGRES_URL points to local Docker PostgreSQL.
+    Phase 2A: POSTGRES_URL switches to Azure PostgreSQL Flexible Server.
+              The URL gains ?sslmode=require because Azure enforces TLS.
+              No code change needed -- just update .env.
+
     We read it from .env so the password is never hardcoded in source code.
     """
-    # os.getenv("POSTGRES_URL") reads POSTGRES_URL from environment variables.
-    # If not found, it returns None — which would cause a connection error below.
-    return psycopg2.connect(os.getenv("POSTGRES_URL"))
+    conn = psycopg2.connect(os.getenv("POSTGRES_URL"))
+
+    # Register the pgvector type with this connection so psycopg2 can
+    # deserialize 'vector' columns into Python lists/numpy arrays.
+    # Only runs if the pgvector package is installed (Phase 2A+).
+    if PGVECTOR_AVAILABLE:
+        register_vector(conn)
+
+    return conn
 
 
 def init_db():
     """
-    Creates the 'documents' table if it doesn't already exist.
-    Called once at API startup (from main.py).
+    Creates all database tables if they don't already exist.
+    Called once at API startup (from main.py lifespan handler).
 
-    FUTURE — Phase 2A will add this column to support vector search:
-        embedding vector(1536)   ← stores AI-generated float arrays
+    Tables created:
+      - documents       : one row per uploaded file (Phase 0)
+      - document_chunks : one row per text chunk with its embedding vector (Phase 2A)
+
+    Safe to re-run: every statement uses IF NOT EXISTS / IF NOT EXISTS.
     """
-    # Open a connection to PostgreSQL
     conn = get_connection()
-
-    # Create a cursor — the object that sends SQL to the database and reads results.
-    # In .NET: var cmd = new SqlCommand(sql, conn);
     cursor = conn.cursor()
 
-    # KEY PYTHON CONCEPT — Triple-quoted strings:
-    # """ ... """ is Python's multiline string syntax.
-    # Equivalent to C#'s verbatim string: @"..."
-    # Used here to write a clean, readable multi-line SQL statement.
+    # -------------------------------------------------------------------------
+    # Step 1: Enable the pgvector extension
+    # -------------------------------------------------------------------------
+    # pgvector adds the 'vector' column type to PostgreSQL.
+    # Without this, CREATE TABLE ... embedding vector(1536) fails.
+    #
+    # Local Docker: pgvector/pgvector:pg16 image has the extension pre-installed.
+    # Azure PostgreSQL: the extension is pre-installed but must be whitelisted via:
+    #   az postgres flexible-server parameter set --name azure.extensions --value vector
+    #   (done in phase-2a-postgres.ps1)
+    #
+    # IF NOT EXISTS makes this idempotent -- safe to call every startup.
+    cursor.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+
+    # -------------------------------------------------------------------------
+    # Step 2: Create the documents table (Phase 0 — unchanged)
+    # -------------------------------------------------------------------------
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS documents (
             id           SERIAL PRIMARY KEY,
@@ -80,21 +103,81 @@ def init_db():
             created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
     """)
-    # Notes on each column:
-    #   SERIAL         = auto-incrementing integer, like IDENTITY(1,1) in SQL Server
-    #   DEFAULT        = value used when no value is supplied on INSERT
-    #   CURRENT_TIMESTAMP = PostgreSQL function that returns the current date+time
-    #   IF NOT EXISTS  = safe to run every startup — skips silently if table exists
+    # SERIAL      = auto-incrementing integer (like IDENTITY(1,1) in SQL Server)
+    # IF NOT EXISTS = skips silently if the table already exists -- safe on every restart
 
-    # commit() saves the CREATE TABLE permanently to the database.
-    # Without it, the table only exists for this connection session and is lost on close.
-    # In EF Core this is: await context.SaveChangesAsync();
+    # -------------------------------------------------------------------------
+    # Step 3: Create the document_chunks table (Phase 2A — NEW)
+    # -------------------------------------------------------------------------
+    # Each row = one chunk of text from a document + its embedding vector.
+    #
+    # Why chunks instead of storing the whole document as one embedding?
+    #   1. LLMs have a token limit (~8K for ada-002). A large PDF won't fit.
+    #   2. Chunking lets us find the SPECIFIC paragraph that answers a question,
+    #      not just "this document is related."
+    #   3. Smaller chunks = more precise retrieval = better RAG answers.
+    #
+    # embedding vector(1536):
+    #   - 'vector' is the pgvector type. The number is the dimension count.
+    #   - Azure OpenAI text-embedding-ada-002 outputs exactly 1536 dimensions.
+    #   - Each dimension is a float32. Total: 1536 * 4 bytes = ~6KB per chunk.
+    #   - In .NET: conceptually like storing a float[] as a DB column.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS document_chunks (
+            id           SERIAL PRIMARY KEY,
+            document_id  INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+            chunk_index  INTEGER NOT NULL,
+            chunk_text   TEXT NOT NULL,
+            token_count  INTEGER,
+            embedding    vector(1536),
+            created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    """)
+    # ON DELETE CASCADE: when a document row is deleted, all its chunks are
+    # automatically deleted too. Prevents orphaned chunk rows.
+    # chunk_index: position of this chunk in the original document (0, 1, 2...)
+    # token_count: how many tokens this chunk used (useful for monitoring cost)
+    # embedding:   NULL until Phase 2A-2 processes the document and calls OpenAI
+
+    # -------------------------------------------------------------------------
+    # Step 4: Create indexes for query performance
+    # -------------------------------------------------------------------------
+
+    # Standard B-tree index on document_id — speeds up queries like:
+    # "give me all chunks for document 42" (used in Phase 2A-2 processing)
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_chunks_document_id
+        ON document_chunks(document_id);
+    """)
+
+    # HNSW vector index — the core of fast similarity search (Phase 2A-3)
+    #
+    # HNSW = Hierarchical Navigable Small World
+    #   A graph-based index that organises vectors so similar ones are
+    #   connected. Think of it like a geographic map — cities (vectors) close
+    #   to each other have roads (graph edges) between them.
+    #
+    # Why HNSW and not IVFFlat (the other pgvector index type)?
+    #   IVFFlat requires a training step: you must load data first, then run
+    #   VACUUM ANALYZE before it works. HNSW builds incrementally -- you can
+    #   query it after adding just one row. Better for our use case.
+    #
+    # vector_cosine_ops: use cosine distance for similarity.
+    #   Cosine measures the ANGLE between two vectors, not their magnitude.
+    #   Standard for text embeddings -- same word in short vs long documents
+    #   gets the same embedding angle regardless of document length.
+    #
+    # m = 16:             connections per node. Higher = better recall, more memory.
+    # ef_construction=64: quality of index build. Higher = better index, slower build.
+    #   These defaults are the pgvector recommended starting point.
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_chunks_embedding
+        ON document_chunks USING hnsw (embedding vector_cosine_ops)
+        WITH (m = 16, ef_construction = 64);
+    """)
+
     conn.commit()
-
-    # Always close cursor and connection to free up database resources.
-    # In .NET, a 'using' statement does this automatically.
-    # In Python, you close manually — or use a 'with' block (we'll refactor this later).
     cursor.close()
     conn.close()
 
-    print("✅ Database ready")
+    print("✅ Database ready (documents + document_chunks + HNSW index)")

@@ -1,0 +1,51 @@
+# =============================================================================
+# tests.http — REST Client API Tests
+# =============================================================================
+# Install "REST Client" by Huachao Mao in VS Code.
+# Click "Send Request" above any ### block to fire that HTTP request.
+# This file grows with each phase.
+# =============================================================================
+
+@baseUrl = http://localhost:8000
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PHASE 0 / 1a — Core API
+# ─────────────────────────────────────────────────────────────────────────────
+
+### 1. Health Check — verify the API is running
+GET {{baseUrl}}/health
+
+###
+
+### 2. List all documents — should return JSON array
+GET {{baseUrl}}/documents/
+
+###
+
+### 3. Upload a document (multipart form)
+# Replace the file content below with anything — this creates a real upload.
+POST {{baseUrl}}/documents/upload
+Content-Type: multipart/form-data; boundary=boundary123
+
+--boundary123
+Content-Disposition: form-data; name="file"; filename="test-document.txt"
+Content-Type: text/plain
+
+This is a test document for CogniDocs Phase 1.
+When uploaded, this file goes to Azure Blob Storage.
+Event Grid then fires a BlobCreated event.
+The Azure Function receives the event and publishes to Service Bus.
+In Phase 2, the worker will chunk and embed this text.
+--boundary123--
+
+###
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PHASE 1b — Azure Function health (after deployment)
+# Replace <your-function-app> with your actual Function App name.
+# ─────────────────────────────────────────────────────────────────────────────
+
+### 4. Check Function App is running
+GET https://func-cognidocs.azurewebsites.net/api/health
+
+###
