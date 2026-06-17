@@ -1,4 +1,12 @@
-# Phase 1: Azure Functions worker dependencies will go here
-# azure-servicebus
-# azure-storage-blob
-# python-dotenv
+# Azure Functions runtime — required for all Python Function Apps
+azure-functions
+
+# Phase 1c: publish and receive messages on Azure Service Bus topics
+azure-servicebus>=7.11.0
+
+# Load secrets from .env file locally (same pattern used in api/ and ui/)
+# Not needed in Azure -- Azure Functions reads os.environ from App Settings directly
+python-dotenv>=1.0.1
+
+# Phase 2 (uncomment when needed):
+# azure-openai>=1.30.0     ← Azure OpenAI SDK for generating embeddings

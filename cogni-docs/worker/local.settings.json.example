@@ -1,0 +1,17 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "FUNCTIONS_WORKER_RUNTIME": "python",
+    "AzureWebJobsStorage": "Endpoint=sb://sb-cognidocs.servicebus.windows.net/;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=tl43wWbYCNHWgt/dbD3TR8KRUYcKYvtSY+ASbGlt8dE=",
+    "AzureServiceBusConnectionString": "<paste your Service Bus connection string here>",
+    "ServiceBusTopic": "document-processing"
+  }
+}
+
+// Copy this file to local.settings.json and fill in real values.
+// local.settings.json is NEVER committed — it's in .gitignore.
+//
+// FUNCTIONS_WORKER_RUNTIME: tells the host this is a Python function app.
+// AzureWebJobsStorage: the Function host uses Blob Storage internally for
+//                      state management, lock files, and timers.
+// AzureServiceBusConnectionString: our Service Bus namespace connection string.
